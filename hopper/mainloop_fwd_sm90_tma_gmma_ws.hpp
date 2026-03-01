@@ -1138,13 +1138,17 @@ struct CollectiveMainloopFwdSm90 {
         if constexpr (IntraWGOverlap) {
             Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_MNK{}));
             consumer_wait(pipeline_k, smem_pipe_read);
+            asm volatile ("pmevent.mask 0xaaa1; // qk_gemm_90 begin");
             flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
+            asm volatile ("pmevent.mask 0xaaa2; // qk_gemm_90 end");
             warpgroup_wait<0>();
             pipeline_k.consumer_release(smem_pipe_read);
             if constexpr (HasQv) {
                 shared_storage.pipelines.barrier_Qv.wait(work_idx % 2);
                 consumer_wait(pipeline_v, smem_pipe_read);
+                asm volatile ("pmevent.mask 0xfff1; // qv_gemm_90 begin");
                 flash::gemm</*zero_init=*/false, /*wg_wait=*/0>(tiled_mma_qv, tSrQv, tSrV(_, _, _, smem_pipe_read.index()), tSrS);
+                asm volatile ("pmevent.mask 0xfff2; // qv_gemm_90 end");
             }
             scoremod_premask_fn(tSrS);
             mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block);
@@ -1174,12 +1178,16 @@ struct CollectiveMainloopFwdSm90 {
                 Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_MNK{}));
                 if (!UseSchedulerBarrier || warp_group_idx == 0) { consumer_wait(pipeline_k, smem_pipe_read); }
                 warp_scheduler_barrier_sync();
+                asm volatile ("pmevent.mask 0xaaa1; // qk_gemm_90 begin");
                 flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
+                asm volatile ("pmevent.mask 0xaaa2; // qk_gemm_90 end");
                 if constexpr (RescaleOBeforeGemm) { softmax.rescale_o(tOrO, scores_scale); }
                 if constexpr(!HasQv) {
                     if (!UseSchedulerBarrier || warp_group_idx == 0) { consumer_wait(pipeline_v, smem_pipe_read_v); }
                 }
+                asm volatile ("pmevent.mask 0xbbb1; // pv_gemm_90 begin");
                 flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
+                asm volatile ("pmevent.mask 0xbbb2; // pv_gemm_90 end");
                 warp_scheduler_barrier_arrive();
                 warpgroup_wait<1>();
                 pipeline_k.consumer_release(smem_pipe_read);  // release K
@@ -1187,7 +1195,9 @@ struct CollectiveMainloopFwdSm90 {
                     warpgroup_wait<0>();
                     pipeline_v.consumer_release(smem_pipe_read_v);  // release V
                     consumer_wait(pipeline_v, smem_pipe_read);
+                    asm volatile ("pmevent.mask 0xfff1; // qv_gemm_90 begin");
                     flash::gemm</*zero_init=*/false, /*wg_wait=*/0>(tiled_mma_qv, tSrQv, tSrV(_, _, _, smem_pipe_read.index()), tSrS);
+                    asm volatile ("pmevent.mask 0xfff2; // qv_gemm_90 end");
                 }
                 scoremod_premask_fn(tSrS);
                 mask_fn(tSrS, n_block);
@@ -1237,7 +1247,9 @@ struct CollectiveMainloopFwdSm90 {
             cutlass::arch::NamedBarrier::arrive(NumMmaThreadsQK + (Use_TMA_Q ? cutlass::NumThreadsPerWarp : NumProducerThreads), static_cast<uint32_t>(FwdNamedBarriers::QueryEmpty) /*id*/);
             if constexpr (RescaleOBeforeGemm) { softmax.rescale_o(tOrO, scores_scale); }
             if constexpr (!HasQv) { consumer_wait(pipeline_v, smem_pipe_read); }
+            asm volatile ("pmevent.mask 0xbbb1; // pv_gemm_90 start");
             flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read.index()), tOrO);
+            asm volatile ("pmevent.mask 0xbbb2; // pv_gemm_90 end");
             float const v_descale = !Is_FP8 || params.ptr_v_descale == nullptr ? 1.0f : params.ptr_v_descale[bidb * get<0>(params.stride_v_descale) + bidh_kv * get<1>(params.stride_v_descale)];
             cute::copy(softmax.finalize(v_descale), scores_scale);
             if constexpr (LargeHeadDimV) {
@@ -1262,7 +1274,9 @@ struct CollectiveMainloopFwdSm90 {
                 if constexpr (!Is_first_iter) { ++smem_pipe_read; }
                 Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_MNK{}));
                 consumer_wait(pipeline_k, smem_pipe_read);
+                asm volatile ("pmevent.mask 0xccc1; // qk_gemm_90_no_overlap start");
                 flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
+                asm volatile ("pmevent.mask 0xccc2; // qk_gemm_90_no_overlap end");
                 if constexpr (!HasQv) {
                     warp_scheduler_barrier_arrive();
                     warpgroup_wait<0>();
@@ -1272,7 +1286,9 @@ struct CollectiveMainloopFwdSm90 {
                         shared_storage.pipelines.barrier_Qv.wait(work_idx % 2);
                     }
                     consumer_wait(pipeline_v, smem_pipe_read);
+                    asm volatile ("pmevent.mask 0xddd1; // qv_gemm_90_no_overlap start");
                     flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_qv, tSrQv, tSrV(_, _, _, smem_pipe_read.index()), tSrS);
+                    asm volatile ("pmevent.mask 0xddd2; // qv_gemm_90_no_overlap end");
                     warp_scheduler_barrier_arrive();
                     warpgroup_wait<1>();
                     pipeline_k.consumer_release(smem_pipe_read);  // release K
@@ -1294,10 +1310,14 @@ struct CollectiveMainloopFwdSm90 {
                 if constexpr (!HasQv) { consumer_wait(pipeline_v, smem_pipe_read); }
                 warp_scheduler_barrier_sync();
                 if constexpr (!MmaPV_use_RS_WG1) {
+                    asm volatile ("pmevent.mask 0xeee1; // pv_gemm_90_no_overlap start");
                     flash::gemm</*zero_init=*/Is_first_iter, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read.index()), tOrO);
+                    asm volatile ("pmevent.mask 0xeee2; // pv_gemm_90_no_overlap end");
                 } else {
                     TiledMmaPV_RS tiled_mma_pv_rs;
+                    asm volatile ("pmevent.mask 0xeee1; // pv_gemm_90_no_overlap start");
                     flash::gemm</*zero_init=*/Is_first_iter, /*wg_wait=*/-1>(tiled_mma_pv_rs, tOrP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);
+                    asm volatile ("pmevent.mask 0xeee2; // pv_gemm_90_no_overlap end");
                 }
                 if constexpr (!MmaPV_is_RS && MmaPV_use_RS_WG1) { arrive_on_P_write_barrier(); }
                 warpgroup_wait<0>();

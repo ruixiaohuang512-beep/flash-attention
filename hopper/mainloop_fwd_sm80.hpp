@@ -597,10 +597,12 @@ struct CollectiveMainloopFwdSm80 {
             };
             Tensor tSrQ_cur = cute::conditional_return<Q_in_regs>(tSrQ, thr_mma.partition_fragment_A(sQ));
             Tensor tSrK = thr_mma.partition_fragment_B(sK(_, _, _0{}));
+            asm volatile ("pmevent.mask 0x8881; // qk_gemm begin");
             flash::gemm_sm80<Q_in_regs>(
                 tSrS, tSrQ_cur, tSrK, tSsQ, tSsK(_, _, _, kStages > 1 ? smem_pipe_read : 0),
                 tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K, load_V_next
             );
+            asm volatile ("pmevent.mask 0x8882; // qk_gemm begin");
             smem_pipe_write = smem_pipe_write < kStages - 1 ? smem_pipe_write + 1 : 0;
             scoremod_premask_fn(tSrS);
             // Faster to load_K before gemm if we only have 1 stage
@@ -615,7 +617,9 @@ struct CollectiveMainloopFwdSm80 {
             if constexpr (!Is_first_iter) { softmax.rescale_o(tOrO, scores_scale); }
             if constexpr (kStages > 1) { sync(); }
             Tensor tOrV = thr_mma.partition_fragment_B(sVt(_, _, _0{}));
+            asm volatile ("pmevent.mask 0x9991; // qk_gemm begin");
             flash::gemm_rs_sm80(tOrO, tOrP, tOrV, tOsVt(_, _, _, kStages > 1 ? smem_pipe_read : 0), tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+            asm volatile ("pmevent.mask 0x9992; // qk_gemm begin");
             if constexpr (kStages > 1) { load_K_next(); }
             smem_pipe_read = smem_pipe_read < kStages - 1 ? smem_pipe_read + 1 : 0;
         };

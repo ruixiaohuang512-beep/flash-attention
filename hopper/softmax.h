@@ -49,15 +49,19 @@ __device__ __forceinline__ void reduce_(Tensor<Engine0, Layout0> const& tensor, 
 
 template<bool zero_init=true, typename Engine0, typename Layout0, typename Engine1, typename Layout1>
 __device__ __forceinline__ void reduce_max(Tensor<Engine0, Layout0> const& tensor, Tensor<Engine1, Layout1> &max){
+    asm volatile ("pmevent.mask 0x1111; // reduce_max begin");
     MaxOp<float> max_op;
     reduce_<zero_init>(tensor, max, max_op);
+    asm volatile ("pmevent.mask 0x1112; // reduce_max end");
 }
 
 template<bool zero_init=true, bool warp_reduce=true, typename Engine0, typename Layout0, typename Engine1, typename Layout1>
 __device__ __forceinline__ void reduce_sum(Tensor<Engine0, Layout0> const& tensor, Tensor<Engine1, Layout1> &sum){
+    asm volatile ("pmevent.mask 0x2221; // reduce_sum begin");
     SumOp<float> sum_op;
     thread_reduce_<zero_init>(tensor, sum, sum_op);
     if constexpr (warp_reduce) { quad_allreduce_(sum, sum, sum_op); }
+    asm volatile ("pmevent.mask 0x2222; // reduce_sum end");
 }
 
 // Apply the exp to all the elements.
@@ -66,6 +70,7 @@ template <bool Scale_max=true, bool Check_inf=true, int Max_offset=0,
 __forceinline__ __device__ void scale_apply_exp2(Tensor<Engine0, Layout0> &tensor, Tensor<Engine1, Layout1> const &max, const float scale) {
     // For FP8, we can subtract max by 8.0 so that the value after exp2 is in the range of [0, 256].
     // This lets us use more of the FP8 range (instead of just [0, 1]) to reduce underflow.
+    asm volatile ("pmevent.mask 0x3331; // scale_apply_exp2 begin");
     static constexpr float max_offset = float(Max_offset);  // We can only template on int, not float
     static_assert(Layout0::rank == 2, "Only support 2D Tensor");
     static_assert(Layout1::rank == 1, "Only support 1D Tensor");
@@ -85,6 +90,7 @@ __forceinline__ __device__ void scale_apply_exp2(Tensor<Engine0, Layout0> &tenso
             tensor(mi, ni) = exp2f(tensor(mi, ni) * scale - max_scaled);
         }
     }
+    asm volatile ("pmevent.mask 0x3332; // scale_apply_exp2 end"); 
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -101,6 +107,7 @@ struct Softmax {
     template<bool Is_first, bool Check_inf=false, typename Tensor0>
     __forceinline__ __device__ TensorT max_get_scale(Tensor0 &acc_s) {
         // Reshape acc_s from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
+        asm volatile ("pmevent.mask 0x4441; // max_get_scale begin");
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
         static_assert(CUTE_STATIC_V(size<0>(scores)) == kNRows);
         TensorT scores_scale;
@@ -120,21 +127,26 @@ struct Softmax {
                 row_sum(mi) *= scores_scale(mi);
             }
         }
+        asm volatile ("pmevent.mask 0x4442; // max_get_scale end");
         return scores_scale;
+        
     };
 
     template<bool Is_first, bool Check_inf=false, typename Tensor0>
     __forceinline__ __device__ void online_softmax(Tensor0 &acc_s) {
         // Reshape acc_s from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
+        asm volatile ("pmevent.mask 0x5551; // online_softmax begin");
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
         static_assert(CUTE_STATIC_V(size<0>(scores)) == kNRows);
         flash::template scale_apply_exp2</*Scale_max=*/true, Check_inf, Max_offset>(scores, row_max, softmax_scale_log2);
         // We don't do the reduce across threads here since we don't need to use the row_sum.
         // We do that reduce at the end when we need to normalize the softmax.
         flash::reduce_sum</*zero_init=*/Is_first, /*warp_reduce=*/false>(scores, row_sum);
+        asm volatile ("pmevent.mask 0x5552; // online_softmax end");
     };
 
     __forceinline__ __device__ TensorT finalize(float const final_scale=1.f) {
+        asm volatile ("pmevent.mask 0x6661; // finalize begin");
         SumOp<float> sum_op;
         quad_allreduce_(row_sum, row_sum, sum_op);
         TensorT scores_scale;
@@ -150,12 +162,15 @@ struct Softmax {
             }
             row_sum(mi) = (sum == 0.f || sum != sum) ? -INFINITY : row_max(mi) * (softmax_scale_log2 * float(M_LN2)) + __logf(sum);
         }
+        asm volatile ("pmevent.mask 0x6662; // finalize end");
         return scores_scale;
+        
     };
 
     template<typename Tensor1>
     __forceinline__ __device__ void rescale_o(Tensor1 &acc_o, TensorT const &scores_scale) {
         // Reshape acc_o from (MMA=4, MMA_M, MMA_K) to (nrow=(2, MMA_M), ncol=(2, MMA_K))
+        asm volatile ("pmevent.mask 0x7771; // rescale_o begin");
         Tensor acc_o_rowcol = make_tensor(acc_o.data(), flash::convert_layout_acc_rowcol(acc_o.layout()));
         static_assert(CUTE_STATIC_V(size<0>(acc_o_rowcol)) == kNRows);
         #pragma unroll
@@ -163,7 +178,9 @@ struct Softmax {
             #pragma unroll
             for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) { acc_o_rowcol(mi, ni) *= scores_scale(mi); }
         }
+        asm volatile ("pmevent.mask 0x7772; // rescale_o end");
     };
+
 
 };
 
